@@ -1,0 +1,209 @@
+/*
+  ESP32 -> ThingSpeak (3 channels)
+  Sensors (all on the same I2C bus):
+    MAX30102/MAX30105 (HR, SpO2 approx, IR)  -> Channel 1
+    MPU6050 (accel, gyro, temp)              -> Channel 2
+    BMP280 (temp, pressure, altitude)        -> Channel 3
+
+  Wiring (ESP32 DevKit):
+    SDA -> GPIO21     SCL -> GPIO22
+    VCC -> 3.3V       GND -> GND   (for all three sensors)
+
+  I2C addresses (no conflict): MAX30102 = 0x57, MPU6050 = 0x68, BMP280 = 0x76/0x77
+
+  Libraries (Library Manager):
+    ThingSpeak (MathWorks), Adafruit BMP280, Adafruit MPU6050,
+    Adafruit Unified Sensor, SparkFun MAX3010x Pulse and Proximity Sensor Library
+
+  ThingSpeak channel fields to create:
+    Channel 1: Field1 = BPM, Field2 = SpO2 (%), Field3 = IR raw
+    Channel 2: Field1..3 = Accel X,Y,Z (m/s^2), Field4..6 = Gyro X,Y,Z (rad/s), Field7 = Temp (C)
+    Channel 3: Field1 = Temp (C), Field2 = Pressure (hPa), Field3 = Altitude (m)
+*/
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <ThingSpeak.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+// ---------- WiFi ----------
+const char* WIFI_SSID = "Airtel_arun_3707";
+const char* WIFI_PASS = "Air@88053";
+
+// ---------- ThingSpeak: one ID + Write API Key per channel ----------
+unsigned long CH1_ID = 3530869;            // MAX30102 channel
+const char*   CH1_KEY = "IXOPKM10FAUY6HQX";
+
+unsigned long CH2_ID = 3530864;            // MPU6050 channel
+const char*   CH2_KEY = "739UR27I4Z8OGT1M";
+
+unsigned long CH3_ID = 3530696;            // BMP280 channel
+const char*   CH3_KEY = "D3H51HLQ6J5FR615";
+
+// Free ThingSpeak accounts allow 1 update per channel every 15 s
+const unsigned long UPLOAD_INTERVAL = 20000;  // ms
+
+// ---------- Objects ----------
+WiFiClient client;
+MAX30105 particleSensor;
+Adafruit_MPU6050 mpu;
+Adafruit_BMP280 bmp;
+
+// ---------- MAX30102 working variables ----------
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+double dcRed = 0, dcIr = 0, acRed = 0, acIr = 0;
+float spo2 = 0;
+long irValue = 0;
+
+unsigned long lastUpload = 0;
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 40) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED ? "\nWiFi connected" : "\nWiFi FAILED");
+}
+
+// Read MAX30102 continuously (must be called very often in loop)
+void readMAX30102() {
+  long red = particleSensor.getRed();
+  irValue = particleSensor.getIR();
+
+  if (irValue < 50000) {            // no finger on sensor
+    beatAvg = 0;
+    spo2 = 0;
+    dcRed = dcIr = acRed = acIr = 0;
+    return;
+  }
+
+  // ---- Heart rate ----
+  if (checkForBeat(irValue)) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+    beatsPerMinute = 60.0 / (delta / 1000.0);
+    if (beatsPerMinute > 20 && beatsPerMinute < 255) {
+      rates[rateSpot++] = (byte)beatsPerMinute;
+      rateSpot %= RATE_SIZE;
+      beatAvg = 0;
+      for (byte i = 0; i < RATE_SIZE; i++) beatAvg += rates[i];
+      beatAvg /= RATE_SIZE;
+    }
+  }
+
+  // ---- Rough SpO2 (ratio-of-ratios, NOT medically calibrated) ----
+  if (dcRed == 0) { dcRed = red; dcIr = irValue; }
+  dcRed = 0.95 * dcRed + 0.05 * red;
+  dcIr  = 0.95 * dcIr  + 0.05 * irValue;
+  acRed = 0.99 * acRed + 0.01 * sq(red - dcRed);
+  acIr  = 0.99 * acIr  + 0.01 * sq(irValue - dcIr);
+
+  if (acRed > 0 && acIr > 0 && dcRed > 0 && dcIr > 0) {
+    double R = (sqrt(acRed) / dcRed) / (sqrt(acIr) / dcIr);
+    float est = 110.0 - 25.0 * R;
+    spo2 = constrain(est, 70.0, 100.0);
+  }
+}
+
+void uploadChannel1() {
+  ThingSpeak.setField(1, beatAvg);
+  ThingSpeak.setField(2, spo2);
+  ThingSpeak.setField(3, (long)irValue);
+  int code = ThingSpeak.writeFields(CH1_ID, CH1_KEY);
+  Serial.printf("CH1 (MAX30102) -> %s (code %d)\n", code == 200 ? "OK" : "FAIL", code);
+}
+
+void uploadChannel2() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  ThingSpeak.setField(1, a.acceleration.x);
+  ThingSpeak.setField(2, a.acceleration.y);
+  ThingSpeak.setField(3, a.acceleration.z);
+  ThingSpeak.setField(4, g.gyro.x);
+  ThingSpeak.setField(5, g.gyro.y);
+  ThingSpeak.setField(6, g.gyro.z);
+  ThingSpeak.setField(7, temp.temperature);
+  int code = ThingSpeak.writeFields(CH2_ID, CH2_KEY);
+  Serial.printf("CH2 (MPU6050)  -> %s (code %d)\n", code == 200 ? "OK" : "FAIL", code);
+}
+
+void uploadChannel3() {
+  ThingSpeak.setField(1, bmp.readTemperature());
+  ThingSpeak.setField(2, bmp.readPressure() / 100.0F);     // Pa -> hPa
+  ThingSpeak.setField(3, bmp.readAltitude(1013.25));       // sea-level hPa
+  int code = ThingSpeak.writeFields(CH3_ID, CH3_KEY);
+  Serial.printf("CH3 (BMP280)   -> %s (code %d)\n", code == 200 ? "OK" : "FAIL", code);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  // MAX30102
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found!");
+    while (1) delay(10);
+  }
+  // brightness, sampleAverage, ledMode(2 = Red+IR), sampleRate, pulseWidth, adcRange
+  particleSensor.setup(0x3F, 4, 2, 400, 411, 4096);
+
+  // MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+    while (1) delay(10);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // BMP280 (address is 0x76 or 0x77 depending on module)
+  if (!bmp.begin(0x76) && !bmp.begin(0x77)) {
+    Serial.println("BMP280 not found!");
+    while (1) delay(10);
+  }
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                  Adafruit_BMP280::SAMPLING_X2,
+                  Adafruit_BMP280::SAMPLING_X16,
+                  Adafruit_BMP280::FILTER_X16,
+                  Adafruit_BMP280::STANDBY_MS_500);
+
+  connectWiFi();
+  ThingSpeak.begin(client);
+  lastUpload = millis();
+}
+
+void loop() {
+  // Keep sampling the pulse sensor as fast as possible
+  readMAX30102();
+
+  if (millis() - lastUpload >= UPLOAD_INTERVAL) {
+    lastUpload = millis();
+    connectWiFi();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      uploadChannel1();
+      delay(1000);               // small gap between channel writes
+      uploadChannel2();
+      delay(1000);
+      uploadChannel3();
+    }
+    lastUpload = millis();       // restart timer after the blocking uploads
+  }
+}
